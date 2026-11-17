@@ -37,10 +37,13 @@ static bool taken(void)
 
 // With Wi-Fi off, a mesh app opening doesn't pause it: scanning or joining then
 // would take the app's radio. Go on once it closes, as a resume would. False:
-// someone else drove Wi-Fi meanwhile.
-static bool wait_for_mesh_apps(void)
+// someone else drove Wi-Fi meanwhile. *waited (if given) is set when it had to wait.
+static bool wait_for_mesh_apps(bool *waited)
 {
     while (!taken() && os_mesh_held()) {
+        if (waited) {
+            *waited = true;
+        }
         vTaskDelay(pdMS_TO_TICKS(500));
     }
     return !taken();
@@ -55,8 +58,7 @@ static bool join(const char *ssid, const char *pass, bool *waited)
 {
     *waited = false;
     for (;;) {
-        *waited |= os_mesh_held();
-        if (!wait_for_mesh_apps()) {
+        if (!wait_for_mesh_apps(waited)) {
             return false;
         }
         os_wifi_connect(ssid, pass);
@@ -86,7 +88,7 @@ static bool join_older(char *ssid, char *pass)
     int n = 0;
     while (!scanning && !past(start, SCAN_MS) && !taken()) {
         if (os_mesh_held()) {
-            if (!wait_for_mesh_apps()) {
+            if (!wait_for_mesh_apps(NULL)) {
                 free(recs);
                 return false;
             }
