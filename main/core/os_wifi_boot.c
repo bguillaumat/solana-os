@@ -46,6 +46,29 @@ static bool wait_for_mesh_apps(void)
     return !taken();
 }
 
+// Join once no mesh app is open, then check again: os_mesh_acquire counts an app
+// and reads Wi-Fi under one lock, so an app that opened around the join either
+// saw it (and pauses it) or shows here. Then back off (the join is still
+// scanning the mesh channel) and join again once it closes. False: someone else
+// drove Wi-Fi meanwhile. *waited: a mesh app had to close first.
+static bool join(const char *ssid, const char *pass, bool *waited)
+{
+    *waited = false;
+    for (;;) {
+        *waited |= os_mesh_held();
+        if (!wait_for_mesh_apps()) {
+            return false;
+        }
+        os_wifi_connect(ssid, pass);
+        s_mine = os_wifi_changes();
+        if (!os_mesh_held()) {
+            return true;
+        }
+        os_wifi_set_enabled(false);
+        s_mine = os_wifi_changes();
+    }
+}
+
 // The most recent saved network isn't here: Wi-Fi off (the driver doesn't scan
 // while it joins), scan both bands and join the most recent older saved network
 // in range. True: joining it, and ssid/pass now name it. False: Wi-Fi stays off
@@ -103,22 +126,9 @@ static bool join_older(char *ssid, char *pass)
     }
     strlcpy(ssid, s, 33);
     strlcpy(pass, p, 65);
-    for (;;) {
-        if (!wait_for_mesh_apps()) {
-            return false;
-        }
-        ESP_LOGI(TAG, "looking for '%s'", ssid);
-        os_wifi_connect(ssid, pass);
-        s_mine = os_wifi_changes();
-        if (!os_mesh_held()) {
-            return true;    // a mesh app opening from here on sees the join and pauses it
-        }
-        // One opened around the connect, and may have seen Wi-Fi off and left it
-        // running: back off (the join is still scanning the mesh channel) and
-        // join again once it closes.
-        os_wifi_set_enabled(false);
-        s_mine = os_wifi_changes();
-    }
+    ESP_LOGI(TAG, "looking for '%s'", ssid);
+    bool waited;
+    return join(ssid, pass, &waited);
 }
 
 static void boot_join_task(void *arg)
@@ -152,14 +162,16 @@ static void boot_join_task(void *arg)
         if (late) {
             break;          // lent to a mesh app: resuming rejoins, as after any join
         }
-        // Gave up early: keep listening until 30 s, unless a mesh app opened
-        // (it doesn't pause a Wi-Fi that gave up, so a retry would take its radio).
-        if (in.state == OS_WIFI_FAILED && !os_mesh_held()) {
-            os_wifi_connect(ssid, pass);
-            s_mine = os_wifi_changes();
-            if (os_mesh_held()) {
-                os_wifi_set_enabled(false);     // one opened around the retry: as above, no retry under it
+        // Gave up early: keep listening until 30 s. A mesh app doesn't pause a
+        // Wi-Fi that gave up, so the retry waits for open ones to close (as a
+        // resume would rejoin), and the 30 s start again then.
+        if (in.state == OS_WIFI_FAILED) {
+            bool waited;
+            if (!join(ssid, pass, &waited)) {
                 break;
+            }
+            if (waited) {
+                start = xTaskGetTickCount();
             }
         }
     }
