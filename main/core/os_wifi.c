@@ -37,7 +37,7 @@ static bool s_join_scan;        // the one-channel scan before a join is running
 static bool s_join_pending;     // a join waits for the app's scan to finish
 static bool s_pinned;           // the STA config names one AP (BSSID + channel)
 static int s_retries, s_park, s_want_ch;
-static wifi_ap_record_t *s_scan_cache;  // the app's scan, read at SCAN_DONE
+static wifi_ap_record_t *s_scan_cache;  // a caller's scan (an app, os_wifi_boot), read at SCAN_DONE
 static uint16_t s_scan_n;
 static const char *s_fail;
 static volatile bool s_scan_done;
@@ -347,7 +347,7 @@ esp_err_t os_wifi_connect_ch(const char *ssid, const char *pass, int channel)
     os_wifi_saved_ssid(saved, sizeof(saved));
     strlcpy(s_ssid, ssid, sizeof(s_ssid));
     strlcpy(s_pass, pass ? pass : "", sizeof(s_pass));
-    // Rejoining the saved network with its stored password needs no save.
+    // Rejoining the most recent saved network with its stored password needs no save.
     char saved_pass[65] = "";
     s_save_on_ip = strcmp(saved, s_ssid) || !os_wifi_saved_pass(saved_pass, sizeof(saved_pass)) ||
                    strcmp(saved_pass, s_pass);

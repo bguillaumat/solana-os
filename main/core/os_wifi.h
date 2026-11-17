@@ -1,6 +1,6 @@
 #pragma once
 
-// System Wi-Fi service. Owns the driver (STA, dual-band), joins the saved
+// System Wi-Fi service. Owns the driver (STA, dual-band), joins a saved
 // network at boot (os_wifi_boot) and when the user turns Wi-Fi on, and lets radio-hungry apps (ESP-NOW
 // sniffer, mesh apps) borrow the radio with suspend/resume. While no network
 // is joined the radio waits on the park channel (the mesh channel), so

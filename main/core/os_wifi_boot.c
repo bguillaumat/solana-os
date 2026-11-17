@@ -3,9 +3,11 @@
 // from its network neither keeps scanning nor keeps the radio off the mesh
 // channel. With older saved networks too, a most recent one that isn't found
 // (it gave up, or 30 s went by) makes way for the most recent older one a scan
-// finds, which gets its own 30 s. Portable: only the os_wifi API (and
-// os_mesh_held), from a task that ends once it has joined or given up; it
-// outlives the boot only while waiting for a mesh app to close.
+// finds, which gets its own 30 s. Nothing it does happens while the radio is
+// lent out (a mesh app is open, or Wi-Fi is suspended), and lent time doesn't
+// count toward those 30 s. Portable: only the os_wifi API (and os_mesh_held),
+// from a task that ends once it has joined or given up; it outlives the boot
+// only while the radio stays lent out.
 
 #include <stdlib.h>
 #include <string.h>
@@ -35,12 +37,24 @@ static bool taken(void)
     return os_wifi_changes() != s_mine;
 }
 
-// With Wi-Fi off, a mesh app opening doesn't pause it: scanning or joining then
-// would take the app's radio. Go on once it closes, as a resume would. False:
-// someone else drove Wi-Fi meanwhile. *waited (if given) is set when it had to wait.
+// The radio is lent out: a mesh app is open (with Wi-Fi off or given up, its
+// acquire didn't pause Wi-Fi), or Wi-Fi is suspended (a mesh app, or the
+// ESP-NOW app, which suspends it directly). Scanning or joining now would take it.
+static bool lent(void)
+{
+    return os_mesh_held() || os_wifi_state() == OS_WIFI_SUSPENDED;
+}
+
+// Go on once the radio is back, as a resume would. False: someone else drove
+// Wi-Fi meanwhile. *waited (if given) is set when it had to wait.
 static bool wait_for_mesh_apps(bool *waited)
 {
-    while (!taken() && os_mesh_held()) {
+    bool logged = false;
+    while (!taken() && lent()) {
+        if (!logged) {
+            ESP_LOGI(TAG, "radio lent out: waiting for it");
+            logged = true;
+        }
         if (waited) {
             *waited = true;
         }
@@ -81,13 +95,14 @@ static bool join_older(char *ssid, char *pass)
     s_mine = os_wifi_changes();
     wifi_ap_record_t *recs = malloc(SCAN_MAX * sizeof(*recs));      // the task's stack is small
     if (!recs) {
+        ESP_LOGW(TAG, "no memory for a scan: Wi-Fi off");
         return false;
     }
     TickType_t start = xTaskGetTickCount();
     bool scanning = false;
     int n = 0;
     while (!scanning && !past(start, SCAN_MS) && !taken()) {
-        if (os_mesh_held()) {
+        if (lent()) {
             if (!wait_for_mesh_apps(NULL)) {
                 free(recs);
                 return false;
@@ -96,9 +111,10 @@ static bool join_older(char *ssid, char *pass)
         }
         scanning = os_wifi_scan_start() == ESP_OK;
         if (!scanning) {
-            vTaskDelay(pdMS_TO_TICKS(250));     // another scan runs, or the radio is lent out
+            vTaskDelay(pdMS_TO_TICKS(250));     // another scan runs
         }
     }
+    TickType_t scan_t0 = xTaskGetTickCount();
     // Even if someone takes over meanwhile, let the scan end and read it: that
     // frees the results os_wifi keeps for whoever started the scan.
     while (scanning && !os_wifi_scan_done() && !past(start, SCAN_MS)) {
@@ -106,18 +122,22 @@ static bool join_older(char *ssid, char *pass)
     }
     if (scanning && os_wifi_scan_done()) {
         n = os_wifi_scan_results(recs, SCAN_MAX);
-        ESP_LOGI(TAG, "scan: %d access points in %d ms", n, (int)((xTaskGetTickCount() - start) * portTICK_PERIOD_MS));
+        ESP_LOGI(TAG, "scan: %d access points in %d ms", n, (int)((xTaskGetTickCount() - scan_t0) * portTICK_PERIOD_MS));
     } else if (!taken()) {
-        ESP_LOGW(TAG, "no scan within %d s", SCAN_MS / 1000);
+        ESP_LOGW(TAG, "no scan within %d s: Wi-Fi off", SCAN_MS / 1000);
+        free(recs);
+        return false;
     }
     if (taken()) {
         free(recs);
         return false;
     }
+    // The most recent saved one in range other than the network that didn't
+    // join (by name: the list may have changed meanwhile).
     char s[33], p[65];
     bool found = false;
-    for (int i = 1; !found && os_wifi_saved_get(i, s, sizeof(s), p, sizeof(p)); i++) {
-        for (int j = 0; j < n && !found; j++) {
+    for (int i = 0; !found && os_wifi_saved_get(i, s, sizeof(s), p, sizeof(p)); i++) {
+        for (int j = 0; strcmp(s, ssid) && j < n && !found; j++) {
             found = !strcmp((const char *)recs[j].ssid, s);
         }
     }
@@ -146,27 +166,28 @@ static void boot_join_task(void *arg)
         if (in.state == OS_WIFI_CONNECTED || taken() || !in.enabled || strcmp(in.ssid, ssid)) {
             break;          // joined, or someone else drove Wi-Fi (off, on again, another network)
         }
+        if (in.state == OS_WIFI_SUSPENDED) {
+            start = xTaskGetTickCount();    // lent out: the resume rejoins, with 30 s of its own
+            continue;
+        }
         bool late = past(start, BOOT_JOIN_MS);
-        if (older && in.state != OS_WIFI_SUSPENDED && (late || in.state == OS_WIFI_FAILED)) {
+        if (older && (late || in.state == OS_WIFI_FAILED)) {
             older = false;
-            ESP_LOGI(TAG, "'%s' not found: looking for an older saved network", ssid);
+            ESP_LOGI(TAG, "'%s' didn't join: looking for an older saved network", ssid);
             if (!join_older(ssid, pass)) {
                 break;
             }
             start = xTaskGetTickCount();
             continue;
         }
-        if (late && in.state != OS_WIFI_SUSPENDED) {
-            ESP_LOGI(TAG, "'%s' not found in %d s: Wi-Fi off", ssid, BOOT_JOIN_MS / 1000);
+        if (late) {
+            ESP_LOGI(TAG, "'%s' didn't join in %d s: Wi-Fi off", ssid, BOOT_JOIN_MS / 1000);
             os_wifi_set_enabled(false);
             break;
         }
-        if (late) {
-            break;          // lent to a mesh app: resuming rejoins, as after any join
-        }
         // Gave up early: keep listening until 30 s. A mesh app doesn't pause a
-        // Wi-Fi that gave up, so the retry waits for open ones to close (as a
-        // resume would rejoin), and the 30 s start again then.
+        // Wi-Fi that gave up, so the retry waits for the radio (as a resume would
+        // rejoin), and the 30 s start again then.
         if (in.state == OS_WIFI_FAILED) {
             bool waited;
             if (!join(ssid, pass, &waited)) {
