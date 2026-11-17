@@ -21,7 +21,7 @@ static const char *TAG = "wifi_boot";
 #define SCAN_MS         15000       // bound on the dual-band scan for an older network
 #define SCAN_MAX        32
 
-static uint32_t s_mine;     // os_wifi_changes() right after this task's own last call
+static uint32_t s_mine;     // os_wifi_changes() right after boot's own last call
 
 static bool past(TickType_t start, int ms)
 {
@@ -108,6 +108,7 @@ static bool join_older(char *ssid, char *pass)
     strlcpy(pass, p, 65);
     ESP_LOGI(TAG, "looking for '%s'", ssid);
     os_wifi_connect(ssid, pass);
+    s_mine = os_wifi_changes();
     return true;
 }
 
@@ -121,8 +122,8 @@ static void boot_join_task(void *arg)
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(500));
         os_wifi_get_info(&in);
-        if (in.state == OS_WIFI_CONNECTED || !in.enabled || strcmp(in.ssid, ssid)) {
-            break;          // joined, or the user turned it off or picked another network
+        if (in.state == OS_WIFI_CONNECTED || taken() || !in.enabled || strcmp(in.ssid, ssid)) {
+            break;          // joined, or someone else drove Wi-Fi (off, on again, another network)
         }
         bool late = past(start, BOOT_JOIN_MS);
         if (older && in.state != OS_WIFI_SUSPENDED && (late || in.state == OS_WIFI_FAILED)) {
@@ -146,6 +147,7 @@ static void boot_join_task(void *arg)
         // (it doesn't pause a Wi-Fi that gave up, so a retry would take its radio).
         if (in.state == OS_WIFI_FAILED && !os_mesh_held()) {
             os_wifi_connect(ssid, pass);
+            s_mine = os_wifi_changes();
         }
     }
     vTaskDelete(NULL);
@@ -159,6 +161,7 @@ void os_wifi_boot(void)
     }
     ESP_LOGI(TAG, "looking for '%s'", ssid);
     os_wifi_set_enabled(true);
+    s_mine = os_wifi_changes();
     if (xTaskCreate(boot_join_task, "wifi_boot", 3072, NULL, 2, NULL) != pdPASS) {
         ESP_LOGW(TAG, "no task: Wi-Fi stays on");
     }
