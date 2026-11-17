@@ -101,15 +101,24 @@ static bool join_older(char *ssid, char *pass)
         ESP_LOGI(TAG, "no older saved network in range: Wi-Fi off");
         return false;
     }
-    if (!wait_for_mesh_apps()) {
-        return false;
-    }
     strlcpy(ssid, s, 33);
     strlcpy(pass, p, 65);
-    ESP_LOGI(TAG, "looking for '%s'", ssid);
-    os_wifi_connect(ssid, pass);
-    s_mine = os_wifi_changes();
-    return true;
+    for (;;) {
+        if (!wait_for_mesh_apps()) {
+            return false;
+        }
+        ESP_LOGI(TAG, "looking for '%s'", ssid);
+        os_wifi_connect(ssid, pass);
+        s_mine = os_wifi_changes();
+        if (!os_mesh_held()) {
+            return true;    // a mesh app opening from here on sees the join and pauses it
+        }
+        // One opened around the connect, and may have seen Wi-Fi off and left it
+        // running: back off (the join is still scanning the mesh channel) and
+        // join again once it closes.
+        os_wifi_set_enabled(false);
+        s_mine = os_wifi_changes();
+    }
 }
 
 static void boot_join_task(void *arg)
@@ -148,6 +157,10 @@ static void boot_join_task(void *arg)
         if (in.state == OS_WIFI_FAILED && !os_mesh_held()) {
             os_wifi_connect(ssid, pass);
             s_mine = os_wifi_changes();
+            if (os_mesh_held()) {
+                os_wifi_set_enabled(false);     // one opened around the retry: as above, no retry under it
+                break;
+            }
         }
     }
     vTaskDelete(NULL);
